@@ -1,0 +1,14 @@
+# Environment
+.env
+.venv/
+__pycache__/
+
+# Database
+database/*.db
+
+# Reports (generated output)
+reports/*.pdf
+reports/*.xlsx
+
+# OS
+.DS_Store
