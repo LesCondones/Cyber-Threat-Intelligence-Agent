@@ -410,9 +410,9 @@ class ReportGenerator:
                 ("CVE IDs", iocs.cve_ids),
                 ("Emails", iocs.emails),
             ]
-            if hasattr(iocs, "urls") and iocs.urls:
+            if iocs.urls:
                 ioc_pairs.append(("URLs", iocs.urls))
-            if hasattr(iocs, "malware_names") and iocs.malware_names:
+            if iocs.malware_names:
                 ioc_pairs.append(("Malware Names", iocs.malware_names))
 
             if any(items for _, items in ioc_pairs):
@@ -625,10 +625,8 @@ class ReportGenerator:
             all_sha256s.update(f.iocs.sha256_hashes)
             all_cves.update(f.iocs.cve_ids)
             all_emails.update(f.iocs.emails)
-            if hasattr(f.iocs, "urls"):
-                all_urls.update(f.iocs.urls)
-            if hasattr(f.iocs, "malware_names"):
-                all_malware.update(f.iocs.malware_names)
+            all_urls.update(f.iocs.urls)
+            all_malware.update(f.iocs.malware_names)
 
         any_iocs = any([
             all_ips, all_domains, all_md5s, all_sha256s,

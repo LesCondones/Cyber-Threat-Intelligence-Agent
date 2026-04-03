@@ -207,14 +207,13 @@ class IOCStore:
         type_map = {
             "ip": ioc_results.ipv4_addresses,
             "domain": ioc_results.domains,
+            "url": ioc_results.urls,
             "md5": ioc_results.md5_hashes,
             "sha256": ioc_results.sha256_hashes,
             "cve": ioc_results.cve_ids,
             "email": ioc_results.emails,
+            "malware": ioc_results.malware_names,
         }
-        # Include URLs if the IOCResults has them
-        if hasattr(ioc_results, "urls"):
-            type_map["url"] = ioc_results.urls
 
         for ioc_type, values in type_map.items():
             for value in values:

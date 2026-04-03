@@ -481,10 +481,8 @@ class CoordinatorAgent:
             merged.md5_hashes = list(set(merged.md5_hashes + f.iocs.md5_hashes))
             merged.sha256_hashes = list(set(merged.sha256_hashes + f.iocs.sha256_hashes))
             merged.cve_ids = list(set(merged.cve_ids + f.iocs.cve_ids))
-            if hasattr(f.iocs, "urls"):
-                merged.urls = list(set(merged.urls + f.iocs.urls))
-            if hasattr(f.iocs, "malware_names"):
-                merged.malware_names = list(set(merged.malware_names + f.iocs.malware_names))
+            merged.urls = list(set(merged.urls + f.iocs.urls))
+            merged.malware_names = list(set(merged.malware_names + f.iocs.malware_names))
         return merged.to_stix_bundle()
 
 
