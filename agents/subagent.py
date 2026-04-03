@@ -249,7 +249,13 @@ class SubAgent:
                 if len(best_content) > 4000:
                     best_content = best_content[:4000] + "\n[...]"
                 search_content.append(best_content)
-                raw_text_for_iocs.append(result.raw_content or result.content)
+                # Cap content for IOC extraction — article body (where real
+                # IOCs live) comes first in Tavily markdown; page chrome
+                # (navbars, footers, sidebars) is appended after.
+                ioc_content = result.raw_content or result.content
+                if len(ioc_content) > 8000:
+                    ioc_content = ioc_content[:8000]
+                raw_text_for_iocs.append(ioc_content)
                 raw_sources.append(SourceContent(
                     title=result.title, url=result.url,
                     content=best_content,

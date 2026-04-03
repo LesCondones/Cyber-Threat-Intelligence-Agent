@@ -58,6 +58,11 @@ def _escape_xml(text: str) -> str:
             .replace(">", "&gt;"))
 
 
+# Maximum IOCs to display per type in each report section
+MAX_IOCS_PER_TYPE_PER_FINDING = 15
+MAX_IOCS_PER_TYPE_CONSOLIDATED = 30
+
+
 SEVERITY_COLORS = {
     "Critical": colors.HexColor("#FF0000"),
     "High": colors.HexColor("#FF8C00"),
@@ -122,6 +127,25 @@ def _build_styles():
     styles.add(ParagraphStyle(
         name="FrameworkField", parent=styles["BodyText"],
         fontSize=10, leading=14, spaceAfter=4,
+    ))
+    styles.add(ParagraphStyle(
+        name="TableCell", parent=styles["BodyText"],
+        fontSize=9, leading=12, spaceAfter=0, spaceBefore=0,
+    ))
+    styles.add(ParagraphStyle(
+        name="TableCellBold", parent=styles["BodyText"],
+        fontSize=9, leading=12, spaceAfter=0, spaceBefore=0,
+        fontName="Helvetica-Bold",
+    ))
+    styles.add(ParagraphStyle(
+        name="TableCellMono", parent=styles["BodyText"],
+        fontSize=8, leading=11, spaceAfter=0, spaceBefore=0,
+        fontName="Courier",
+    ))
+    styles.add(ParagraphStyle(
+        name="TableHeaderCell", parent=styles["BodyText"],
+        fontSize=9, leading=12, spaceAfter=0, spaceBefore=0,
+        fontName="Helvetica-Bold", textColor=colors.white,
     ))
 
     return styles
@@ -276,21 +300,28 @@ class ReportGenerator:
         # ── Severity Overview ──
         elements.append(Paragraph("Threat Severity Overview", styles["SectionHeading"]))
 
-        table_data = [["Finding", "Severity"]]
+        table_data = [[
+            Paragraph("Finding", styles["TableHeaderCell"]),
+            Paragraph("Severity", styles["TableHeaderCell"]),
+        ]]
         row_colors = []
         for f in findings:
-            table_data.append([f.topic, f.severity])
+            table_data.append([
+                Paragraph(_escape_xml(f.topic), styles["TableCell"]),
+                Paragraph(f.severity, styles["TableCellBold"]),
+            ])
             row_colors.append(SEVERITY_COLORS.get(f.severity, colors.lightgrey))
 
-        table = Table(table_data, colWidths=[4.5 * inch, 1.5 * inch])
+        table = Table(table_data, colWidths=[5.0 * inch, 1.5 * inch])
         style_cmds = [
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#4472C4")),
-            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-            ("FONTSIZE", (0, 0), (-1, -1), 10),
             ("ALIGN", (1, 0), (1, -1), "CENTER"),
             ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
             ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("TOPPADDING", (0, 0), (-1, -1), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+            ("LEFTPADDING", (0, 0), (-1, -1), 6),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 6),
             ("ROWBACKGROUNDS", (0, 1), (-1, -1),
              [colors.HexColor("#F2F2F2"), colors.white]),
         ]
@@ -391,8 +422,12 @@ class ReportGenerator:
                 ))
                 for label, items in ioc_pairs:
                     if items:
+                        display_items = items[:MAX_IOCS_PER_TYPE_PER_FINDING]
+                        suffix = ""
+                        if len(items) > MAX_IOCS_PER_TYPE_PER_FINDING:
+                            suffix = f" ... (+{len(items) - MAX_IOCS_PER_TYPE_PER_FINDING} more)"
                         elements.append(Paragraph(
-                            f"<i>{label}:</i>  {', '.join(items)}",
+                            f"<i>{label}:</i>  {', '.join(display_items)}{suffix}",
                             styles["IOCText"],
                         ))
 
@@ -480,12 +515,21 @@ class ReportGenerator:
             elements.append(PageBreak())
             elements.append(Paragraph("IOC Enrichment Results", styles["SectionHeading"]))
 
-            enrich_data = [["IOC", "Type", "Risk Score", "Risk Level", "Malicious"]]
+            enrich_data = [[
+                Paragraph("IOC", styles["TableHeaderCell"]),
+                Paragraph("Type", styles["TableHeaderCell"]),
+                Paragraph("Risk Score", styles["TableHeaderCell"]),
+                Paragraph("Risk Level", styles["TableHeaderCell"]),
+                Paragraph("Malicious", styles["TableHeaderCell"]),
+            ]]
             enrich_row_colors = []
             for r in enrichment_summary.results:
                 enrich_data.append([
-                    r.ioc_value, r.ioc_type, str(r.risk_score),
-                    r.risk_level, "Yes" if r.malicious else "No",
+                    Paragraph(_escape_xml(r.ioc_value), styles["TableCellMono"]),
+                    Paragraph(_escape_xml(r.ioc_type), styles["TableCell"]),
+                    Paragraph(str(r.risk_score), styles["TableCell"]),
+                    Paragraph(_escape_xml(r.risk_level), styles["TableCell"]),
+                    Paragraph("Yes" if r.malicious else "No", styles["TableCell"]),
                 ])
                 if r.risk_score >= 60:
                     enrich_row_colors.append(colors.HexColor("#FFCCCC"))
@@ -500,13 +544,13 @@ class ReportGenerator:
             )
             enrich_style_cmds = [
                 ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#4472C4")),
-                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                ("FONTSIZE", (0, 0), (-1, -1), 8),
-                ("FONTNAME", (0, 1), (0, -1), "Courier"),
                 ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
                 ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
                 ("ALIGN", (2, 0), (-1, -1), "CENTER"),
+                ("TOPPADDING", (0, 0), (-1, -1), 3),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+                ("LEFTPADDING", (0, 0), (-1, -1), 4),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 4),
             ]
             for i, bg in enumerate(enrich_row_colors, start=1):
                 enrich_style_cmds.append(("BACKGROUND", (0, i), (-1, i), bg))
@@ -539,9 +583,19 @@ class ReportGenerator:
                 "MITRE ATT&CK Technique Mappings", styles["SectionHeading"]
             ))
 
-            mitre_data = [["Tactic", "Technique ID", "Technique", "Confidence"]]
+            mitre_data = [[
+                Paragraph("Tactic", styles["TableHeaderCell"]),
+                Paragraph("Technique ID", styles["TableHeaderCell"]),
+                Paragraph("Technique", styles["TableHeaderCell"]),
+                Paragraph("Confidence", styles["TableHeaderCell"]),
+            ]]
             for m in mitre_mappings:
-                mitre_data.append([m.tactic, m.technique_id, m.technique, m.confidence])
+                mitre_data.append([
+                    Paragraph(_escape_xml(m.tactic), styles["TableCell"]),
+                    Paragraph(_escape_xml(m.technique_id), styles["TableCell"]),
+                    Paragraph(_escape_xml(m.technique), styles["TableCell"]),
+                    Paragraph(_escape_xml(m.confidence), styles["TableCell"]),
+                ])
 
             mitre_table = Table(
                 mitre_data,
@@ -549,11 +603,12 @@ class ReportGenerator:
             )
             mitre_table.setStyle(TableStyle([
                 ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#4472C4")),
-                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                ("FONTSIZE", (0, 0), (-1, -1), 9),
                 ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
                 ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("TOPPADDING", (0, 0), (-1, -1), 3),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+                ("LEFTPADDING", (0, 0), (-1, -1), 4),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 4),
                 ("ROWBACKGROUNDS", (0, 1), (-1, -1),
                  [colors.HexColor("#F2F2F2"), colors.white]),
             ]))
@@ -584,6 +639,16 @@ class ReportGenerator:
             elements.append(Paragraph(
                 "Consolidated Indicators of Compromise", styles["SectionHeading"]
             ))
+            total_ioc_count = (
+                len(all_ips) + len(all_domains) + len(all_urls)
+                + len(all_md5s) + len(all_sha256s) + len(all_cves)
+                + len(all_emails) + len(all_malware)
+            )
+            elements.append(Paragraph(
+                f"<i>Total unique indicators extracted: {total_ioc_count}</i>",
+                styles["Timestamp"],
+            ))
+            elements.append(Spacer(1, 6))
             for label, items in [
                 ("IPv4 Addresses", sorted(all_ips)),
                 ("Domains", sorted(all_domains)),
@@ -595,8 +660,14 @@ class ReportGenerator:
                 ("Malware Names", sorted(all_malware)),
             ]:
                 if items:
-                    elements.append(Paragraph(f"<b>{label}</b>", styles["BodyWrap"]))
-                    for item in items:
+                    cap = MAX_IOCS_PER_TYPE_CONSOLIDATED
+                    count_note = ""
+                    if len(items) > cap:
+                        count_note = f" (showing {cap} of {len(items)})"
+                    elements.append(Paragraph(
+                        f"<b>{label}{count_note}</b>", styles["BodyWrap"]
+                    ))
+                    for item in items[:cap]:
                         elements.append(Paragraph(item, styles["IOCText"]))
                     elements.append(Spacer(1, 6))
 
