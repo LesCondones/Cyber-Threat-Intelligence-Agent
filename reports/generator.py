@@ -31,11 +31,12 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
 from reportlab.platypus import (
     SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image,
-    PageBreak, HRFlowable,
+    PageBreak, HRFlowable, XPreformatted, KeepTogether,
 )
 
 from agents.subagent import ResearchFinding
 from agents.mitre_mapper import MITREMapping
+from agents.source_classifier import classify_source
 
 
 def _strip_markdown(text: str) -> str:
@@ -78,6 +79,26 @@ SEVERITY_HEX = {
     "Low": "#32CD32",
     "Unknown": "#D3D3D3",
 }
+
+PRIORITY_COLORS = {
+    "Critical": colors.HexColor("#FFC7C7"),
+    "High": colors.HexColor("#FFE0B2"),
+    "Medium": colors.HexColor("#FFF6B2"),
+    "Low": colors.HexColor("#D9F2D9"),
+}
+
+THREAT_STATUS_COLORS = {
+    "Active": "#CC0000",
+    "Historical": "#666699",
+    "Anticipated": "#0066CC",
+    "Unknown": "#777777",
+}
+
+# Canonical Lockheed Martin Cyber Kill Chain phases
+KILL_CHAIN_PHASES = [
+    "Reconnaissance", "Weaponization", "Delivery", "Exploitation",
+    "Installation", "Command and Control", "Actions on Objectives",
+]
 
 
 def _build_styles():
@@ -147,6 +168,29 @@ def _build_styles():
         fontSize=9, leading=12, spaceAfter=0, spaceBefore=0,
         fontName="Helvetica-Bold", textColor=colors.white,
     ))
+    styles.add(ParagraphStyle(
+        name="TLDRBullet", parent=styles["BodyText"],
+        fontSize=11, leading=15, spaceAfter=4,
+        leftIndent=14, textColor=colors.HexColor("#1a1a2e"),
+    ))
+    styles.add(ParagraphStyle(
+        name="CodeBlock", parent=styles["BodyText"],
+        fontSize=8, leading=10, fontName="Courier",
+        leftIndent=8, rightIndent=8, spaceAfter=6,
+        backColor=colors.HexColor("#F4F4F4"),
+        borderColor=colors.HexColor("#CCCCCC"),
+        borderWidth=0.5, borderPadding=6,
+    ))
+    styles.add(ParagraphStyle(
+        name="RecommendationAction", parent=styles["BodyText"],
+        fontSize=10, leading=14, spaceAfter=2,
+        fontName="Helvetica-Bold",
+    ))
+    styles.add(ParagraphStyle(
+        name="RecommendationMeta", parent=styles["BodyText"],
+        fontSize=9, leading=12, spaceAfter=4,
+        textColor=colors.HexColor("#444444"),
+    ))
 
     return styles
 
@@ -182,6 +226,57 @@ def _build_severity_chart(findings: List[ResearchFinding]) -> Image:
     return Image(buf, width=5 * inch, height=2.8 * inch)
 
 
+def _build_kill_chain_diagram(kill_chain_phases) -> Image:
+    """Render a horizontal Kill Chain flow showing which phases have evidence."""
+    observed = {p.phase: p for p in kill_chain_phases}
+
+    fig, ax = plt.subplots(figsize=(7, 1.8))
+    n = len(KILL_CHAIN_PHASES)
+    x_positions = list(range(n))
+
+    for i, phase in enumerate(KILL_CHAIN_PHASES):
+        has_evidence = phase in observed
+        face_color = "#FF6B6B" if has_evidence else "#E0E0E0"
+        edge_color = "#CC0000" if has_evidence else "#A0A0A0"
+
+        ax.add_patch(plt.Rectangle(
+            (i - 0.42, 0.3), 0.84, 0.6,
+            facecolor=face_color, edgecolor=edge_color, linewidth=1.5,
+        ))
+        # Wrap long phase names
+        label = phase.replace("Command and Control", "C2")
+        ax.text(i, 0.6, label, ha="center", va="center",
+                fontsize=8, fontweight="bold",
+                color="white" if has_evidence else "#666666")
+
+        # Arrow to next phase
+        if i < n - 1:
+            ax.annotate(
+                "", xy=(i + 0.58, 0.6), xytext=(i + 0.42, 0.6),
+                arrowprops=dict(
+                    arrowstyle="->",
+                    color="#999999",
+                    lw=1.2,
+                ),
+            )
+
+    ax.set_xlim(-0.6, n - 0.4)
+    ax.set_ylim(0, 1.2)
+    ax.set_aspect("auto")
+    ax.axis("off")
+    ax.set_title(
+        "Cyber Kill Chain — Observed Phases",
+        fontsize=11, fontweight="bold", pad=8,
+    )
+    fig.tight_layout()
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return Image(buf, width=7 * inch, height=1.8 * inch)
+
+
 @dataclass
 class ReportGenerator:
     output_dir: Path = Path("reports")
@@ -198,6 +293,10 @@ class ReportGenerator:
         threat_actor_profiles: Optional[list] = None,
         enrichment_summary: Optional[object] = None,
         framework_analysis: Optional[object] = None,
+        tldr_bullets: Optional[List[str]] = None,
+        threat_status: Optional[str] = None,
+        recommendations: Optional[list] = None,
+        detection_logic: Optional[object] = None,
     ) -> str:
         filename = (
             f"{title.replace(' ', '_').replace(':', '')}"
@@ -214,13 +313,51 @@ class ReportGenerator:
 
         elements = []
 
-        # ── Title & Timestamp ──
+        # ── Title & Timeliness Header ──
         elements.append(Paragraph(title, styles["ReportTitle"]))
-        elements.append(Paragraph(
-            f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-            styles["Timestamp"],
-        ))
-        elements.append(Spacer(1, 12))
+
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        status = (threat_status or "Unknown").strip() or "Unknown"
+        status_color = THREAT_STATUS_COLORS.get(status, "#777777")
+        timeliness_line = (
+            f"<b>Intelligence Collected:</b> {now_str} &nbsp;|&nbsp; "
+            f"<b>Threat Status:</b> "
+            f'<font color="{status_color}"><b>{_escape_xml(status)}</b></font>'
+        )
+        elements.append(Paragraph(timeliness_line, styles["Timestamp"]))
+        elements.append(Spacer(1, 10))
+
+        # ── TL;DR Card ──
+        if tldr_bullets:
+            tldr_inner = [
+                Paragraph(
+                    f'<b>TL;DR — Executive Read</b>',
+                    ParagraphStyle(
+                        name="TLDRTitle", parent=styles["BodyText"],
+                        fontSize=12, leading=14, spaceAfter=6,
+                        textColor=colors.white,
+                    ),
+                ),
+            ]
+            for bullet in tldr_bullets:
+                tldr_inner.append(Paragraph(
+                    f"&bull; {_escape_xml(bullet)}", styles["TLDRBullet"]
+                ))
+            tldr_table = Table(
+                [[item] for item in tldr_inner],
+                colWidths=[7.0 * inch],
+            )
+            tldr_table.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#16213e")),
+                ("BACKGROUND", (0, 1), (-1, -1), colors.HexColor("#F8F9FB")),
+                ("BOX", (0, 0), (-1, -1), 1, colors.HexColor("#16213e")),
+                ("TOPPADDING", (0, 0), (-1, -1), 8),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+                ("LEFTPADDING", (0, 0), (-1, -1), 12),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 12),
+            ]))
+            elements.append(tldr_table)
+            elements.append(Spacer(1, 12))
 
         # ── Intelligence Assessment (if available) ──
         if framework_analysis and hasattr(framework_analysis, "assessment"):
@@ -272,6 +409,118 @@ class ReportGenerator:
                 if para.strip():
                     elements.append(Paragraph(_escape_xml(para.strip()), styles["BodyWrap"]))
             elements.append(Spacer(1, 6))
+
+        # ── Prioritized Recommendations ──
+        if recommendations:
+            elements.append(Paragraph(
+                "Prioritized Recommendations", styles["SectionHeading"]
+            ))
+            elements.append(Paragraph(
+                "<i>Each item is specific enough to assign as a ticket. "
+                "Priority reflects active exploitation, scope, and ease of exploit.</i>",
+                styles["BodyWrap"],
+            ))
+            elements.append(Spacer(1, 4))
+
+            rec_data = [[
+                Paragraph("Priority", styles["TableHeaderCell"]),
+                Paragraph("Action", styles["TableHeaderCell"]),
+                Paragraph("Owner", styles["TableHeaderCell"]),
+                Paragraph("Rationale & References", styles["TableHeaderCell"]),
+            ]]
+            rec_row_colors = []
+            for rec in recommendations:
+                refs = ""
+                if rec.references:
+                    refs = (
+                        f'<br/><font size="8" color="#666666">'
+                        f'Refs: {_escape_xml(", ".join(rec.references[:6]))}'
+                        f'</font>'
+                    )
+                rec_data.append([
+                    Paragraph(rec.priority, styles["TableCellBold"]),
+                    Paragraph(_escape_xml(rec.action), styles["TableCell"]),
+                    Paragraph(_escape_xml(rec.target), styles["TableCell"]),
+                    Paragraph(_escape_xml(rec.rationale) + refs, styles["TableCell"]),
+                ])
+                rec_row_colors.append(
+                    PRIORITY_COLORS.get(rec.priority, colors.HexColor("#F2F2F2"))
+                )
+
+            rec_table = Table(
+                rec_data,
+                colWidths=[0.85 * inch, 2.3 * inch, 1.2 * inch, 2.65 * inch],
+            )
+            rec_style_cmds = [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#4472C4")),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("ALIGN", (0, 0), (0, -1), "CENTER"),
+                ("TOPPADDING", (0, 0), (-1, -1), 5),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+                ("LEFTPADDING", (0, 0), (-1, -1), 5),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+            ]
+            for i, bg in enumerate(rec_row_colors, start=1):
+                rec_style_cmds.append(("BACKGROUND", (0, i), (0, i), bg))
+            rec_table.setStyle(TableStyle(rec_style_cmds))
+            elements.append(rec_table)
+            elements.append(Spacer(1, 10))
+
+        # ── Detection Logic ──
+        if detection_logic and detection_logic.has_any():
+            elements.append(PageBreak())
+            elements.append(Paragraph("Detection Logic", styles["SectionHeading"]))
+            elements.append(Paragraph(
+                "<i>Deployable detection content grounded in the observed TTPs "
+                "and IOCs. Review and tune before promoting to production.</i>",
+                styles["BodyWrap"],
+            ))
+            elements.append(Spacer(1, 6))
+
+            def _code_blocks(section_heading, items, getters):
+                if not items:
+                    return
+                elements.append(Paragraph(
+                    f"<b>{section_heading}</b>", styles["SubHeading"],
+                ))
+                for item in items:
+                    title_field, desc_field, body_field = getters
+                    title_val = getattr(item, title_field)
+                    desc_val = getattr(item, desc_field)
+                    body_val = getattr(item, body_field)
+                    elements.append(KeepTogether([
+                        Paragraph(
+                            f"<b>{_escape_xml(title_val)}</b>",
+                            styles["RecommendationAction"],
+                        ),
+                        Paragraph(
+                            f"<i>{_escape_xml(desc_val)}</i>",
+                            styles["RecommendationMeta"],
+                        ),
+                        XPreformatted(
+                            _escape_xml(body_val.rstrip()),
+                            styles["CodeBlock"],
+                        ),
+                        Spacer(1, 6),
+                    ]))
+
+            _code_blocks(
+                "Sigma Rules", detection_logic.sigma_rules,
+                ("title", "description", "yaml"),
+            )
+            _code_blocks(
+                "YARA Rules", detection_logic.yara_rules,
+                ("name", "description", "body"),
+            )
+            _code_blocks(
+                "Splunk SPL Hunts", detection_logic.splunk_queries,
+                ("title", "description", "query"),
+            )
+            _code_blocks(
+                "Microsoft KQL Hunts", detection_logic.kql_queries,
+                ("title", "description", "query"),
+            )
 
         # ── Key Intelligence Findings ──
         all_key_findings = []
@@ -364,6 +613,8 @@ class ReportGenerator:
                 elements.append(Paragraph(
                     "Cyber Kill Chain Analysis", styles["SectionHeading"]
                 ))
+                elements.append(_build_kill_chain_diagram(kc))
+                elements.append(Spacer(1, 6))
                 for phase in kc:
                     elements.append(Paragraph(
                         f"<b>{_escape_xml(phase.phase)}</b>", styles["SubHeading"]
@@ -436,8 +687,13 @@ class ReportGenerator:
                 elements.append(Paragraph("<b>Sources:</b>", styles["BodyWrap"]))
                 for idx, source in enumerate(finding.sources, 1):
                     safe_title = _escape_xml(source.title)
+                    tag = classify_source(source.url)
+                    tag_tag = (
+                        f' <font size="8" color="#666666">'
+                        f'[{_escape_xml(tag.category)}]</font>'
+                    )
                     elements.append(Paragraph(
-                        f'[{idx}] {safe_title} — '
+                        f'[{idx}] {safe_title}{tag_tag} — '
                         f'<a href="{source.url}" color="blue">{source.url}</a>',
                         styles["SourceLink"],
                     ))

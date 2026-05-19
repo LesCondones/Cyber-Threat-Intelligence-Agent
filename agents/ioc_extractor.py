@@ -1,8 +1,6 @@
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from typing import List, Set, Tuple
-from uuid import uuid4
 
 
 @dataclass
@@ -24,121 +22,6 @@ class IOCResults:
             self.md5_hashes, self.sha256_hashes, self.cve_ids,
             self.emails, self.malware_names,
         ])
-
-    def to_stix_bundle(self) -> dict:
-        """
-        Export IOCs as a STIX 2.1 bundle.
-
-        STIX (Structured Threat Information Expression) is the standard
-        format for sharing cyber threat intelligence. This produces a
-        valid STIX 2.1 JSON bundle that can be imported by TAXII servers,
-        MISP, OpenCTI, and other CTI platforms.
-        """
-        objects = []
-        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-
-        for ip in self.ipv4_addresses:
-            objects.append({
-                "type": "indicator",
-                "spec_version": "2.1",
-                "id": f"indicator--{uuid4()}",
-                "created": now,
-                "modified": now,
-                "name": f"Malicious IP: {ip}",
-                "pattern": f"[ipv4-addr:value = '{ip}']",
-                "pattern_type": "stix",
-                "valid_from": now,
-                "indicator_types": ["malicious-activity"],
-            })
-
-        for domain in self.domains:
-            objects.append({
-                "type": "indicator",
-                "spec_version": "2.1",
-                "id": f"indicator--{uuid4()}",
-                "created": now,
-                "modified": now,
-                "name": f"Malicious Domain: {domain}",
-                "pattern": f"[domain-name:value = '{domain}']",
-                "pattern_type": "stix",
-                "valid_from": now,
-                "indicator_types": ["malicious-activity"],
-            })
-
-        for url in self.urls:
-            objects.append({
-                "type": "indicator",
-                "spec_version": "2.1",
-                "id": f"indicator--{uuid4()}",
-                "created": now,
-                "modified": now,
-                "name": f"Malicious URL: {url}",
-                "pattern": f"[url:value = '{url}']",
-                "pattern_type": "stix",
-                "valid_from": now,
-                "indicator_types": ["malicious-activity"],
-            })
-
-        for md5 in self.md5_hashes:
-            objects.append({
-                "type": "indicator",
-                "spec_version": "2.1",
-                "id": f"indicator--{uuid4()}",
-                "created": now,
-                "modified": now,
-                "name": f"Malicious File (MD5): {md5}",
-                "pattern": f"[file:hashes.MD5 = '{md5}']",
-                "pattern_type": "stix",
-                "valid_from": now,
-                "indicator_types": ["malicious-activity"],
-            })
-
-        for sha256 in self.sha256_hashes:
-            objects.append({
-                "type": "indicator",
-                "spec_version": "2.1",
-                "id": f"indicator--{uuid4()}",
-                "created": now,
-                "modified": now,
-                "name": f"Malicious File (SHA-256): {sha256}",
-                "pattern": f"[file:hashes.'SHA-256' = '{sha256}']",
-                "pattern_type": "stix",
-                "valid_from": now,
-                "indicator_types": ["malicious-activity"],
-            })
-
-        for cve in self.cve_ids:
-            objects.append({
-                "type": "vulnerability",
-                "spec_version": "2.1",
-                "id": f"vulnerability--{uuid4()}",
-                "created": now,
-                "modified": now,
-                "name": cve,
-                "external_references": [{
-                    "source_name": "cve",
-                    "external_id": cve,
-                    "url": f"https://nvd.nist.gov/vuln/detail/{cve}",
-                }],
-            })
-
-        for malware in self.malware_names:
-            objects.append({
-                "type": "malware",
-                "spec_version": "2.1",
-                "id": f"malware--{uuid4()}",
-                "created": now,
-                "modified": now,
-                "name": malware,
-                "is_family": True,
-                "malware_types": ["unknown"],
-            })
-
-        return {
-            "type": "bundle",
-            "id": f"bundle--{uuid4()}",
-            "objects": objects,
-        }
 
 
 class IOCExtractor:

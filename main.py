@@ -17,16 +17,17 @@ from typing import Any, List, Optional, TypedDict
 
 from pydantic import BaseModel, Field
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
 from langgraph.graph import StateGraph, END
 
 from agents.subagent import SubAgent, ResearchFinding
-from agents.mitre_mapper import MITREMapper, MITREMapping
+from agents.mitre_mapper import MITREMapper
 from agents.enrichment_agent import EnrichmentAgent, EnrichmentSummary
 from agents.threat_actor_profiler import ThreatActorProfiler
 from agents.framework_analyst import FrameworkAnalyst
 from agents.feed_monitor import FeedMonitor
 from agents.ioc_extractor import IOCResults
+from agents.recommendations_generator import RecommendationsGenerator, Recommendation
+from agents.detection_logic_generator import DetectionLogicGenerator, DetectionLogic
 from reports.generator import ReportGenerator
 from database.ioc_store import IOCStore
 from config import get_llm, settings
@@ -42,6 +43,26 @@ class InvestigationPlan(BaseModel):
     )
 
 
+class ExecutiveSummaryOutput(BaseModel):
+    """Structured executive summary with TL;DR + threat status alongside prose."""
+    tldr_bullets: List[str] = Field(
+        description="2-4 sharp, executive-facing TL;DR bullets covering "
+                    "the most critical specific findings with concrete data."
+    )
+    threat_status: str = Field(
+        description="One of: Active, Historical, Anticipated. "
+                    "Active = ongoing campaign/exploitation; Historical = past "
+                    "incident with current relevance; Anticipated = emerging risk "
+                    "not yet observed in the wild."
+    )
+    executive_summary: str = Field(
+        description="3-5 paragraph plain-text executive summary grounded in the "
+                    "specific findings. Open with the most critical finding; cover "
+                    "key facts; note confidence level; close with prioritized "
+                    "recommendations. No markdown, no generic advice."
+    )
+
+
 # ── LangGraph State ──
 
 class InvestigationState(TypedDict):
@@ -50,11 +71,15 @@ class InvestigationState(TypedDict):
     queries: dict[str, list[str]]
     findings: list  # List[ResearchFinding]
     all_sources: list  # List[(title, url, content)]
-    mitre_mappings: list  # List[MITREMapping]
+    mitre_mappings: list
     actor_profiles: list  # List[ThreatActorProfile]
     enrichment_summary: Any  # EnrichmentSummary
     framework_analysis: Any  # FrameworkAnalysis
     executive_summary: str
+    tldr_bullets: list[str]
+    threat_status: str
+    recommendations: list  # List[Recommendation]
+    detection_logic: Any  # DetectionLogic
     report_path: str
 
 
@@ -66,6 +91,8 @@ _mitre_mapper = None
 _enrichment_agent = None
 _threat_actor_profiler = None
 _framework_analyst = None
+_recommendations_generator = None
+_detection_logic_generator = None
 _report_generator = None
 _ioc_store = None
 _feed_monitor = None
@@ -74,7 +101,8 @@ _feed_monitor = None
 def _init_agents():
     """Initialize all agents (called once at startup)."""
     global _llm, _mitre_mapper, _enrichment_agent, _threat_actor_profiler
-    global _framework_analyst, _report_generator, _ioc_store, _feed_monitor
+    global _framework_analyst, _recommendations_generator, _detection_logic_generator
+    global _report_generator, _ioc_store, _feed_monitor
 
     _llm = get_llm()
     _mitre_mapper = MITREMapper(_llm)
@@ -85,6 +113,8 @@ def _init_agents():
     )
     _threat_actor_profiler = ThreatActorProfiler(_llm)
     _framework_analyst = FrameworkAnalyst(_llm)
+    _recommendations_generator = RecommendationsGenerator(_llm)
+    _detection_logic_generator = DetectionLogicGenerator(_llm)
     _report_generator = ReportGenerator()
     _ioc_store = IOCStore()
     _feed_monitor = FeedMonitor()
@@ -210,24 +240,24 @@ def research_node(state: InvestigationState) -> dict:
 
 
 def mitre_node(state: InvestigationState) -> dict:
-    """Map findings to MITRE ATT&CK using real technique data."""
+    """Map findings to MITRE ATT&CK using real technique data.
+
+    Combines all findings into a single analysis string and runs the
+    mapper once — one LLM call instead of one-per-finding. The mapper
+    already deduplicates its own output.
+    """
     print(f"\n[MITRE] Mapping to MITRE ATT&CK framework...")
-    all_mitre: List[MITREMapping] = []
-    for finding in state["findings"]:
-        mappings = _mitre_mapper.map_techniques(finding.analysis)
-        all_mitre.extend(mappings)
+    combined_analysis = "\n\n".join(
+        f"[{f.topic}]\n{f.analysis}" for f in state["findings"] if f.analysis
+    )
 
-    # Global dedup across findings
-    seen = set()
-    deduped = []
-    for m in all_mitre:
-        key = (m.tactic, m.technique_id)
-        if key not in seen:
-            seen.add(key)
-            deduped.append(m)
+    if not combined_analysis:
+        print("   No analysis content to map")
+        return {"mitre_mappings": []}
 
-    print(f"   {len(deduped)} unique technique mappings")
-    return {"mitre_mappings": deduped}
+    mappings = _mitre_mapper.map_techniques(combined_analysis)
+    print(f"   {len(mappings)} unique technique mappings")
+    return {"mitre_mappings": mappings}
 
 
 def actor_node(state: InvestigationState) -> dict:
@@ -287,23 +317,20 @@ def framework_node(state: InvestigationState) -> dict:
 
 
 def summary_node(state: InvestigationState) -> dict:
-    """Generate an executive summary grounded in the findings."""
-    print(f"\n[Summary] Generating executive summary...")
+    """Generate executive summary + TL;DR bullets + threat status in one call."""
+    print(f"\n[Summary] Generating executive summary, TL;DR, threat status...")
 
-    # Build key findings text for the summary
     all_key_findings = []
     for f in state["findings"]:
         for kf in f.key_findings:
             all_key_findings.append(f"- {kf.finding} (Source: {kf.source_title})")
     key_findings_text = "\n".join(all_key_findings[:15]) if all_key_findings else "None extracted"
 
-    # Build findings overview
     findings_text = "\n\n".join(
         f"[{f.topic}] (Severity: {f.severity})\n{f.analysis[:800]}"
         for f in state["findings"]
     )
 
-    # Assessment context
     assessment = state.get("framework_analysis")
     confidence_text = ""
     if assessment and hasattr(assessment, "assessment"):
@@ -316,42 +343,102 @@ def summary_node(state: InvestigationState) -> dict:
     summary_chain = (
         ChatPromptTemplate.from_messages([
             ("system", (
-                "You are a senior threat intelligence analyst writing an executive summary. "
-                "Ground your summary in the specific findings and key facts below. "
-                "Do NOT write generic cybersecurity advice. "
-                "Write in plain text — no markdown formatting."
+                "You are a senior threat intelligence analyst writing the "
+                "audience-aligned opener for a CTI report. Ground every output "
+                "in the specific findings below. No generic cybersecurity "
+                "advice. No markdown formatting in the prose summary."
             )),
             ("human", (
-                "Write a concise executive summary (3-5 paragraphs) for:\n\n"
+                "For this investigation, produce a structured output with three parts.\n\n"
                 "Research Topic: {research_topic}\n"
                 "{confidence_text}\n\n"
                 "Key Intelligence Findings:\n{key_findings_text}\n\n"
                 "Detailed Findings:\n{findings_text}\n\n"
-                "The summary must:\n"
-                "1. Open with the most critical specific finding (with data)\n"
-                "2. Cover the key facts discovered across all subtopics\n"
-                "3. Note the confidence level and any intelligence gaps\n"
-                "4. Close with prioritized, specific recommendations\n\n"
-                "Use specific names, dates, and numbers from the findings. "
-                "Do NOT generalize."
+                "Part 1 — TL;DR Bullets (executive-facing): 2-4 sharp bullets, "
+                "each ONE sentence, opening with the most critical finding and "
+                "including specific data (CVE IDs, organization counts, dates, "
+                "actor names). No filler.\n\n"
+                "Part 2 — Threat Status: classify as Active (ongoing campaign or "
+                "exploitation), Historical (past incident with current relevance "
+                "to defenders), or Anticipated (emerging risk, not yet observed "
+                "in the wild).\n\n"
+                "Part 3 — Executive Summary: 3-5 paragraphs of plain text. Open "
+                "with the most critical specific finding; cover key facts across "
+                "subtopics; note confidence level and intelligence gaps; close "
+                "with prioritized recommendations. Use specific names, dates, "
+                "and numbers from the findings."
             )),
         ])
-        | _llm
-        | StrOutputParser()
+        | _llm.with_structured_output(ExecutiveSummaryOutput)
     )
 
-    summary = summary_chain.invoke({
-        "research_topic": state["research_topic"],
-        "key_findings_text": key_findings_text,
-        "findings_text": findings_text,
-        "confidence_text": confidence_text,
-    })
+    try:
+        result = summary_chain.invoke({
+            "research_topic": state["research_topic"],
+            "key_findings_text": key_findings_text,
+            "findings_text": findings_text,
+            "confidence_text": confidence_text,
+        })
+        return {
+            "executive_summary": result.executive_summary,
+            "tldr_bullets": result.tldr_bullets,
+            "threat_status": result.threat_status,
+        }
+    except Exception as e:
+        print(f"   Summary structured output failed ({e}), using fallback")
+        return {
+            "executive_summary": "",
+            "tldr_bullets": [],
+            "threat_status": "Unknown",
+        }
 
-    return {"executive_summary": summary}
+
+def recommendations_node(state: InvestigationState) -> dict:
+    """Generate prioritized, actionable recommendations."""
+    print(f"\n[Recommendations] Generating prioritized recommendations...")
+    recs = _recommendations_generator.generate(
+        research_topic=state["research_topic"],
+        findings=state["findings"],
+        mitre_mappings=state.get("mitre_mappings"),
+        enrichment_summary=state.get("enrichment_summary"),
+    )
+    print(f"   {len(recs)} recommendations generated")
+    return {"recommendations": recs}
+
+
+def detection_logic_node(state: InvestigationState) -> dict:
+    """Generate Sigma rules, YARA rules, and SIEM hunt queries."""
+    print(f"\n[Detection] Generating detection logic (Sigma / YARA / SIEM)...")
+
+    # Merge IOCs across findings for the detection generator
+    merged = IOCResults()
+    for f in state["findings"]:
+        merged.ipv4_addresses = list(set(merged.ipv4_addresses + f.iocs.ipv4_addresses))
+        merged.domains = list(set(merged.domains + f.iocs.domains))
+        merged.md5_hashes = list(set(merged.md5_hashes + f.iocs.md5_hashes))
+        merged.sha256_hashes = list(set(merged.sha256_hashes + f.iocs.sha256_hashes))
+        merged.cve_ids = list(set(merged.cve_ids + f.iocs.cve_ids))
+        merged.urls = list(set(merged.urls + f.iocs.urls))
+        merged.malware_names = list(set(merged.malware_names + f.iocs.malware_names))
+
+    detection = _detection_logic_generator.generate(
+        research_topic=state["research_topic"],
+        mitre_mappings=state.get("mitre_mappings"),
+        iocs=merged,
+        threat_actor_profiles=state.get("actor_profiles"),
+    )
+    counts = (
+        f"sigma={len(detection.sigma_rules)} "
+        f"yara={len(detection.yara_rules)} "
+        f"splunk={len(detection.splunk_queries)} "
+        f"kql={len(detection.kql_queries)}"
+    )
+    print(f"   {counts}")
+    return {"detection_logic": detection}
 
 
 def report_node(state: InvestigationState) -> dict:
-    """Generate the PDF report and persist to database."""
+    """Generate the PDF report and persist findings to the database."""
     print(f"\n[Report] Generating PDF report...")
 
     # Persist to database
@@ -372,7 +459,6 @@ def report_node(state: InvestigationState) -> dict:
             risk_score=result.risk_score, enrichment_data=result.sources,
         )
 
-    # Generate PDF
     enrichment = state.get("enrichment_summary", EnrichmentSummary())
     report_path = _report_generator.create_report(
         title=f"Threat Intelligence: {state['research_topic']}",
@@ -382,6 +468,10 @@ def report_node(state: InvestigationState) -> dict:
         threat_actor_profiles=state["actor_profiles"] or None,
         enrichment_summary=enrichment if enrichment.results else None,
         framework_analysis=state.get("framework_analysis"),
+        tldr_bullets=state.get("tldr_bullets"),
+        threat_status=state.get("threat_status"),
+        recommendations=state.get("recommendations"),
+        detection_logic=state.get("detection_logic"),
     )
 
     # Update investigation with report path
@@ -406,7 +496,8 @@ def build_investigation_graph() -> StateGraph:
 
     Flow:
         plan → research → mitre_map → profile_actors → enrich_iocs
-             → framework_analysis → executive_summary → generate_report → END
+             → framework_analysis → recommendations → detection_logic
+             → executive_summary → generate_report → END
     """
     graph = StateGraph(InvestigationState)
 
@@ -416,6 +507,8 @@ def build_investigation_graph() -> StateGraph:
     graph.add_node("profile_actors", actor_node)
     graph.add_node("enrich_iocs", enrich_node)
     graph.add_node("framework_analysis", framework_node)
+    graph.add_node("recommendations", recommendations_node)
+    graph.add_node("detection_logic", detection_logic_node)
     graph.add_node("executive_summary", summary_node)
     graph.add_node("generate_report", report_node)
 
@@ -425,7 +518,9 @@ def build_investigation_graph() -> StateGraph:
     graph.add_edge("mitre_map", "profile_actors")
     graph.add_edge("profile_actors", "enrich_iocs")
     graph.add_edge("enrich_iocs", "framework_analysis")
-    graph.add_edge("framework_analysis", "executive_summary")
+    graph.add_edge("framework_analysis", "recommendations")
+    graph.add_edge("recommendations", "detection_logic")
+    graph.add_edge("detection_logic", "executive_summary")
     graph.add_edge("executive_summary", "generate_report")
     graph.add_edge("generate_report", END)
 
@@ -458,6 +553,10 @@ class CoordinatorAgent:
             "enrichment_summary": EnrichmentSummary(),
             "framework_analysis": None,
             "executive_summary": "",
+            "tldr_bullets": [],
+            "threat_status": "Unknown",
+            "recommendations": [],
+            "detection_logic": None,
             "report_path": "",
         })
         return result["report_path"]
@@ -471,19 +570,6 @@ class CoordinatorAgent:
         print(f"   Found {len(cves)} recent CVEs" +
               (f" matching '{keyword}'" if keyword else ""))
         return {"alerts": alerts, "cves": cves}
-
-    def export_stix(self, findings: List[ResearchFinding]) -> dict:
-        """Export all IOCs from findings as a STIX 2.1 bundle."""
-        merged = IOCResults()
-        for f in findings:
-            merged.ipv4_addresses = list(set(merged.ipv4_addresses + f.iocs.ipv4_addresses))
-            merged.domains = list(set(merged.domains + f.iocs.domains))
-            merged.md5_hashes = list(set(merged.md5_hashes + f.iocs.md5_hashes))
-            merged.sha256_hashes = list(set(merged.sha256_hashes + f.iocs.sha256_hashes))
-            merged.cve_ids = list(set(merged.cve_ids + f.iocs.cve_ids))
-            merged.urls = list(set(merged.urls + f.iocs.urls))
-            merged.malware_names = list(set(merged.malware_names + f.iocs.malware_names))
-        return merged.to_stix_bundle()
 
 
 def main():
