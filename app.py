@@ -41,6 +41,22 @@ def get_ioc_store():
     return IOCStore()
 
 
+@st.cache_resource
+def get_vector_store():
+    """Initialize VectorStore once across all sessions. Returns None if unavailable."""
+    try:
+        from database.vector_store import VectorStore
+        from config import settings
+        return VectorStore(
+            persist_dir=settings.vector_db_path,
+            model_name=settings.embedding_model,
+        )
+    except Exception as e:
+        # Vector store is optional — page should still render without it
+        print(f"[Vector] Streamlit init failed: {e}")
+        return None
+
+
 # ── Thread-Safe Log Capture ──
 
 class ThreadSafeLogCapture(io.StringIO):
@@ -143,13 +159,8 @@ def render_sidebar():
         # LLM Config Display
         from config import settings
         st.caption("LLM Configuration")
-        provider = settings.llm_provider.value.upper()
-        if provider == "CLAUDE":
-            model = settings.claude_model
-        else:
-            model = settings.ollama_model
-        st.text(f"Provider: {provider}")
-        st.text(f"Model: {model}")
+        st.text("Provider: ANTHROPIC")
+        st.text(f"Model: {settings.anthropic_model}")
 
         st.divider()
 
@@ -382,6 +393,7 @@ def page_knowledge_base():
 
     store = get_ioc_store()
     stats = store.get_graph_summary()
+    vstore = get_vector_store()
 
     # Metric cards
     m1, m2, m3, m4 = st.columns(4)
@@ -389,6 +401,52 @@ def page_knowledge_base():
     m2.metric("IOCs", stats["total_iocs"])
     m3.metric("Threat Actors", stats["total_threat_actors"])
     m4.metric("Relationships", stats["total_relationships"])
+
+    # ── Semantic Search ──
+    st.subheader("Semantic Search")
+    if vstore is None:
+        st.warning(
+            "Vector store unavailable — install dependencies with `uv sync` "
+            "to enable semantic search."
+        )
+    else:
+        total = vstore.count()
+        st.caption(f"{total} indexed documents (findings, summaries, actors, "
+                   "recommendations, detection rules)")
+        sc1, sc2 = st.columns([4, 1])
+        with sc1:
+            query = st.text_input(
+                "Search stored intelligence",
+                placeholder="e.g., ransomware affiliates targeting healthcare",
+                key="semantic_query",
+            )
+        with sc2:
+            type_filter = st.selectbox(
+                "Type",
+                ["All", "finding", "summary", "actor", "recommendation", "detection"],
+                key="semantic_type_filter",
+            )
+
+        if query and query.strip():
+            types = None if type_filter == "All" else [type_filter]
+            hits = vstore.search(query, k=10, types=types)
+            if not hits:
+                st.info("No matching documents.")
+            else:
+                for hit in hits:
+                    topic = hit.metadata.get("topic") or hit.metadata.get("actor_name") or ""
+                    label = f"[{hit.type}] {topic} — score {hit.score:.3f}"
+                    with st.expander(label):
+                        st.markdown(f"**ID:** `{hit.id}`")
+                        meta_pairs = [
+                            f"**{k}:** {v}" for k, v in hit.metadata.items()
+                            if k not in ("topic", "actor_name")
+                        ]
+                        if meta_pairs:
+                            st.caption(" | ".join(meta_pairs))
+                        st.markdown(hit.text[:2000])
+
+    st.divider()
 
     # Tabs
     tab_inv, tab_actors, tab_iocs = st.tabs([

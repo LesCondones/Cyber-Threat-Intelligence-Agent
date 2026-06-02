@@ -30,6 +30,7 @@ from agents.recommendations_generator import RecommendationsGenerator, Recommend
 from agents.detection_logic_generator import DetectionLogicGenerator, DetectionLogic
 from reports.generator import ReportGenerator
 from database.ioc_store import IOCStore
+from database.vector_store import VectorStore, SearchHit
 from config import get_llm, settings
 
 
@@ -95,6 +96,7 @@ _recommendations_generator = None
 _detection_logic_generator = None
 _report_generator = None
 _ioc_store = None
+_vector_store = None
 _feed_monitor = None
 
 
@@ -102,7 +104,7 @@ def _init_agents():
     """Initialize all agents (called once at startup)."""
     global _llm, _mitre_mapper, _enrichment_agent, _threat_actor_profiler
     global _framework_analyst, _recommendations_generator, _detection_logic_generator
-    global _report_generator, _ioc_store, _feed_monitor
+    global _report_generator, _ioc_store, _vector_store, _feed_monitor
 
     _llm = get_llm()
     _mitre_mapper = MITREMapper(_llm)
@@ -117,6 +119,14 @@ def _init_agents():
     _detection_logic_generator = DetectionLogicGenerator(_llm)
     _report_generator = ReportGenerator()
     _ioc_store = IOCStore()
+    try:
+        _vector_store = VectorStore(
+            persist_dir=settings.vector_db_path,
+            model_name=settings.embedding_model,
+        )
+    except Exception as e:
+        print(f"[Vector] init failed (semantic search disabled): {e}")
+        _vector_store = None
     _feed_monitor = FeedMonitor()
 
 
@@ -459,6 +469,44 @@ def report_node(state: InvestigationState) -> dict:
             risk_score=result.risk_score, enrichment_data=result.sources,
         )
 
+    # Vector indexing — index long-form text for semantic search.
+    # Failures must never block the PDF report.
+    if _vector_store is not None:
+        try:
+            topic = state["research_topic"]
+            indexed = 0
+            if state.get("executive_summary"):
+                _vector_store.upsert_executive_summary(
+                    investigation_id, topic, state["executive_summary"]
+                )
+                indexed += 1
+            for i, finding in enumerate(state["findings"]):
+                _vector_store.upsert_finding(investigation_id, topic, finding, i)
+                indexed += 1
+            for profile in state["actor_profiles"]:
+                _vector_store.upsert_threat_actor(profile)
+                indexed += 1
+            for i, rec in enumerate(state.get("recommendations") or []):
+                _vector_store.upsert_recommendation(investigation_id, topic, rec, i)
+                indexed += 1
+            detection = state.get("detection_logic")
+            if detection:
+                for i, rule in enumerate(getattr(detection, "sigma_rules", []) or []):
+                    _vector_store.upsert_detection_rule(investigation_id, topic, "sigma", rule, i)
+                    indexed += 1
+                for i, rule in enumerate(getattr(detection, "yara_rules", []) or []):
+                    _vector_store.upsert_detection_rule(investigation_id, topic, "yara", rule, i)
+                    indexed += 1
+                for i, rule in enumerate(getattr(detection, "splunk_queries", []) or []):
+                    _vector_store.upsert_detection_rule(investigation_id, topic, "splunk", rule, i)
+                    indexed += 1
+                for i, rule in enumerate(getattr(detection, "kql_queries", []) or []):
+                    _vector_store.upsert_detection_rule(investigation_id, topic, "kql", rule, i)
+                    indexed += 1
+            print(f"[Vector] indexed {indexed} docs (total in store: {_vector_store.count()})")
+        except Exception as e:
+            print(f"[Vector] indexing failed (continuing): {e}")
+
     enrichment = state.get("enrichment_summary", EnrichmentSummary())
     report_path = _report_generator.create_report(
         title=f"Threat Intelligence: {state['research_topic']}",
@@ -571,6 +619,22 @@ class CoordinatorAgent:
               (f" matching '{keyword}'" if keyword else ""))
         return {"alerts": alerts, "cves": cves}
 
+    def semantic_search(
+        self,
+        query: str,
+        k: int = 10,
+        types: Optional[List[str]] = None,
+    ) -> List[SearchHit]:
+        """Semantic search across indexed CTI artifacts.
+
+        ``types`` optionally restricts results to one or more of:
+        finding, summary, actor, recommendation, detection.
+        Returns an empty list if the vector store failed to initialize.
+        """
+        if _vector_store is None:
+            return []
+        return _vector_store.search(query, k=k, types=types)
+
 
 def main():
     """CLI entry point."""
@@ -579,11 +643,14 @@ def main():
     print("\n CTI Research System")
     print("=" * 50)
     print("Commands:")
-    print("  [topic]     - Investigate a research topic")
-    print("  feeds       - Check threat intel feeds")
-    print("  feeds:word  - Check feeds filtered by keyword")
-    print("  stats       - Show knowledge graph stats")
-    print("  exit        - Quit")
+    print("  [topic]          - Investigate a research topic")
+    print("  feeds            - Check threat intel feeds")
+    print("  feeds:word       - Check feeds filtered by keyword")
+    print("  search <query>   - Semantic search of stored intel")
+    print("                     (optional --type=finding|summary|actor|")
+    print("                      recommendation|detection)")
+    print("  stats            - Show knowledge graph stats")
+    print("  exit             - Quit")
     print("=" * 50)
 
     while True:
@@ -614,6 +681,32 @@ def main():
             print(f"\n Recent CVEs ({len(result['cves'])}):")
             for cve in result['cves'][:10]:
                 print(f"  {cve.cve_id} (CVSS: {cve.cvss_score}) - {cve.description[:80]}...")
+            continue
+
+        if user_input.lower().startswith('search '):
+            # Parse: search <query...> [--type=<t>]
+            raw = user_input[len('search '):].strip()
+            type_filter: Optional[List[str]] = None
+            tokens = []
+            for tok in raw.split():
+                if tok.startswith('--type='):
+                    type_filter = [tok.split('=', 1)[1].strip()]
+                else:
+                    tokens.append(tok)
+            query = ' '.join(tokens).strip()
+            if not query:
+                print("Usage: search <query> [--type=finding|summary|actor|recommendation|detection]")
+                continue
+            hits = coordinator.semantic_search(query, k=10, types=type_filter)
+            if not hits:
+                print(f"\n No results for '{query}'.")
+                continue
+            print(f"\n {len(hits)} hits for '{query}':")
+            for hit in hits:
+                topic = hit.metadata.get('topic') or hit.metadata.get('actor_name') or ''
+                snippet = hit.text.replace('\n', ' ')[:160]
+                print(f"  [{hit.type:13s}] score={hit.score:.3f}  {topic}")
+                print(f"                  {snippet}{'...' if len(hit.text) > 160 else ''}")
             continue
 
         report_path = coordinator.investigate(user_input)

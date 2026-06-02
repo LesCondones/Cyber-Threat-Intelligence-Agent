@@ -5,6 +5,8 @@ __pycache__/
 
 # Database
 database/*.db
+database/chroma/
+search_cache.py
 
 # Reports (generated output)
 reports/*.pdf
@@ -12,3 +14,7 @@ reports/*.xlsx
 
 # OS
 .DS_Store
+
+tasks/*
+cti_server_setup.sh
+

@@ -13,10 +13,14 @@ CoordinatorAgent.investigate()
     |
     plan ──► research ──► mitre_map ──► profile_actors ──► enrich_iocs
                                                                 |
-    generate_report ◄── executive_summary ◄── framework_analysis
+                                                       framework_analysis
+                                                                |
+    generate_report ◄── executive_summary ◄── detection_logic ◄── recommendations
          |
          +── IOCStore.persist() ──► SQLite knowledge graph
+         +── VectorStore.upsert() ──► Chroma (semantic search index)
          +── ReportGenerator.create_report() ──► PDF
+         +── STIX 2.1 bundle + IOCs CSV + Sigma + YARA side files
 ```
 
 ### Graph Nodes
@@ -24,13 +28,15 @@ CoordinatorAgent.investigate()
 | Node | Function | Description |
 |------|----------|-------------|
 | `plan` | `plan_node` | LLM breaks topic into 3-5 specific subtopics with targeted queries |
-| `research` | `research_node` | Concurrent SubAgent execution per subtopic |
-| `mitre_map` | `mitre_node` | Maps findings to MITRE ATT&CK techniques |
+| `research` | `research_node` | Concurrent SubAgent execution per subtopic (single merged LLM call per subtopic) |
+| `mitre_map` | `mitre_node` | Maps combined findings to MITRE ATT&CK techniques in one call |
 | `profile_actors` | `actor_node` | Identifies and profiles threat actor groups |
 | `enrich_iocs` | `enrich_node` | VirusTotal/Shodan/AbuseIPDB reputation lookups |
 | `framework_analysis` | `framework_node` | Diamond Model, Kill Chain, confidence assessment |
-| `executive_summary` | `summary_node` | Source-grounded executive summary |
-| `generate_report` | `report_node` | PDF generation + SQLite persistence |
+| `recommendations` | `recommendations_node` | Prioritized, actionable recommendations with owner + rationale |
+| `detection_logic` | `detection_logic_node` | Sigma rules, YARA rules, Splunk SPL and KQL hunt queries |
+| `executive_summary` | `summary_node` | TL;DR bullets + threat status + source-grounded executive summary |
+| `generate_report` | `report_node` | PDF generation + STIX/CSV/Sigma/YARA side files + SQLite persistence |
 
 ### Agent Components
 
@@ -47,6 +53,7 @@ CoordinatorAgent.investigate()
 | **Framework Analyst** | `agents/framework_analyst.py` | Diamond Model, Cyber Kill Chain, Admiralty confidence assessment |
 | **Feed Monitor** | `agents/feed_monitor.py` | RSS/CVE feed ingestion |
 | **IOC Store** | `database/ioc_store.py` | SQLite knowledge graph |
+| **Vector Store** | `database/vector_store.py` | Chroma + sentence-transformers semantic search index |
 | **Report Generator** | `reports/generator.py` | PDF reports with charts, tables, framework sections |
 
 ## Setup
@@ -64,24 +71,15 @@ cp .env.example .env
 3. **Add your API keys** to `.env`:
 ```env
 TAVILY_SEARCH_API_KEY=your_key_here
-ANTHROPIC_API_KEY=your_key_here       # Required for Claude
+ANTHROPIC_API_KEY=your_key_here
 
-# LLM Configuration
-LLM_PROVIDER=ollama                   # Options: ollama, claude
-OLLAMA_MODEL=qwen3:8b
-OLLAMA_BASE_URL=http://localhost:11434
-CLAUDE_MODEL=claude-sonnet-4-20250514
+# Anthropic model (defaults to claude-sonnet-4-6)
+ANTHROPIC_MODEL=claude-sonnet-4-6
 
 # Optional enrichment keys (enrichment is skipped if not set)
 VIRUSTOTAL_API_KEY=
 SHODAN_API_KEY=
 ABUSEIPDB_API_KEY=
-```
-
-4. **Ensure Ollama is running** (if using local model):
-```bash
-ollama serve
-ollama pull qwen3:8b
 ```
 
 ## Usage
@@ -95,6 +93,7 @@ Available commands:
 - **[topic]** - Investigate any research topic
 - **feeds** - Check all threat intel feeds
 - **feeds:ransomware** - Check feeds filtered by keyword
+- **search \<query\>** - Semantic search across stored findings, summaries, threat actors, recommendations, and detection rules. Add `--type=finding|summary|actor|recommendation|detection` to filter by content type.
 - **stats** - Show knowledge graph statistics
 - **exit** - Quit
 
@@ -119,14 +118,17 @@ stix_bundle = coordinator.export_stix(findings)
 stats = coordinator.ioc_store.get_graph_summary()
 high_risk = coordinator.ioc_store.get_high_risk_iocs(min_score=60)
 relationships = coordinator.ioc_store.get_relationships("LockBit")
+
+# Semantic search across stored intel (Chroma vector store)
+hits = coordinator.semantic_search("ransomware affiliates targeting healthcare", k=10)
+actor_hits = coordinator.semantic_search("APT29 phishing", k=5, types=["actor"])
 ```
 
-### Switch to Claude
+### Change the Claude model
 
 Edit `.env`:
 ```env
-LLM_PROVIDER=claude
-CLAUDE_MODEL=claude-sonnet-4-20250514
+ANTHROPIC_MODEL=claude-sonnet-4-6
 ```
 
 ## How It Works
@@ -143,17 +145,27 @@ CLAUDE_MODEL=claude-sonnet-4-20250514
 ## Output
 
 ### PDF Report Sections
-- Executive Summary (source-grounded, with confidence level)
-- Threat Severity Overview (table + bar chart)
-- Detailed Findings with key facts and source citations
-- CTI Framework Analysis (Diamond Model, Kill Chain, intelligence assessment)
-- Threat Actor Profiles (motivation, targets, techniques, malware)
-- IOC Enrichment Results (risk scores, detection counts)
-- MITRE ATT&CK Technique Mappings
-- Consolidated Indicators of Compromise
+- **TL;DR card** (executive-facing 2-4 bullets)
+- **Timeliness header** (intelligence-collected timestamp + threat status: Active / Historical / Anticipated)
+- **Intelligence Assessment** (Admiralty confidence + reliability + key judgments + intelligence gaps)
+- **Executive Summary** (source-grounded prose)
+- **Prioritized Recommendations** (action / owner / rationale, color-coded by priority)
+- **Detection Logic** (Sigma rules, YARA rules, Splunk SPL and KQL hunt queries — Preformatted code blocks)
+- **Threat Severity Overview** (table + bar chart)
+- **Diamond Model Analysis**
+- **Cyber Kill Chain** (horizontal flow diagram showing observed vs. unobserved phases)
+- **Detailed Findings** with key facts and source citations (each source tagged Gov / Vendor / Research / News / Blog)
+- **Threat Actor Profiles** (motivation, targets, techniques, malware)
+- **IOC Enrichment Results** (risk scores, detection counts)
+- **MITRE ATT&CK Technique Mappings**
+- **Consolidated Indicators of Compromise**
 
-### STIX 2.1 Export
-IOCs exported as STIX 2.1 bundles for sharing with CTI platforms (MISP, OpenCTI, TAXII servers).
+### Machine-Readable Side Files
+Written alongside the PDF for direct ingestion into SIEM / EDR / TIP:
+- `<report>.stix.json` — STIX 2.1 bundle
+- `<report>.iocs.csv` — Flat CSV (type, value, risk_score, risk_level)
+- `<report>.sigma.yml` — Sigma rules (multi-document YAML)
+- `<report>.yara` — YARA rules
 
 ### Knowledge Graph (SQLite)
 Persistent storage tracks:
@@ -162,6 +174,16 @@ Persistent storage tracks:
 - Threat actor profiles
 - MITRE ATT&CK mappings
 - Entity relationships (actor → uses → malware → communicates_with → domain)
+
+### Semantic Search (Chroma)
+Local vector store sitting alongside SQLite. After every investigation, the following content is embedded with a local `sentence-transformers` model (default `all-MiniLM-L6-v2`) and persisted to `database/chroma/`:
+- Finding analyses (per subtopic) with severity and topic metadata
+- Executive summaries (per investigation)
+- Threat actor profiles (description, targets, techniques, malware)
+- Recommendations (action + rationale + references)
+- Detection rules (Sigma, YARA, Splunk SPL, KQL — title + description + body)
+
+Document IDs are deterministic (e.g. `inv:42:finding:0`, `actor:lockbit`) so re-running an investigation upserts cleanly instead of duplicating entries. No API key is required — embeddings run locally. Override the model or path with `EMBEDDING_MODEL` and `VECTOR_DB_PATH` in `.env`.
 
 ## Feed Monitoring
 
@@ -180,21 +202,26 @@ Built-in RSS feeds:
 ├── .env                           # API keys & config
 ├── .env.example                   # Config template
 ├── main.py                        # LangGraph coordinator + CLI
-├── config.py                      # LLM provider abstraction (Ollama / Claude)
+├── config.py                      # Anthropic Claude configuration
 ├── agents/
-│   ├── searcher.py               # Tavily web search
-│   ├── scraper.py                # WebBaseLoader URL scraper
-│   ├── subagent.py               # Source-grounded research subagent
-│   ├── ioc_extractor.py          # IOC extraction + STIX 2.1 export
-│   ├── mitre_mapper.py           # MITRE ATT&CK mapping
-│   ├── enrichment_agent.py       # VirusTotal/Shodan/AbuseIPDB
-│   ├── threat_actor_profiler.py  # Threat actor profiling
-│   ├── framework_analyst.py      # Diamond Model, Kill Chain, confidence
-│   └── feed_monitor.py           # RSS/CVE feed monitoring
+│   ├── searcher.py                    # Tavily web search (with SQLite cache)
+│   ├── scraper.py                     # WebBaseLoader URL scraper
+│   ├── subagent.py                    # Source-grounded research subagent
+│   ├── ioc_extractor.py               # IOC extraction + STIX 2.1 export
+│   ├── mitre_mapper.py                # MITRE ATT&CK mapping
+│   ├── enrichment_agent.py            # VirusTotal/Shodan/AbuseIPDB
+│   ├── threat_actor_profiler.py       # Threat actor profiling
+│   ├── framework_analyst.py           # Diamond Model, Kill Chain, confidence
+│   ├── recommendations_generator.py   # Prioritized actionable recommendations
+│   ├── detection_logic_generator.py   # Sigma/YARA/SPL/KQL detection content
+│   ├── source_classifier.py           # Deterministic source-type tagging
+│   └── feed_monitor.py                # RSS/CVE feed monitoring
 ├── database/
-│   └── ioc_store.py              # SQLite knowledge graph
+│   ├── ioc_store.py                   # SQLite knowledge graph
+│   ├── vector_store.py                # Chroma semantic search index
+│   └── search_cache.py                # Tavily search-result cache (7-day TTL)
 ├── reports/
-│   └── generator.py              # PDF report generation
+│   └── generator.py                   # PDF report + side files
 ├── tasks/
 │   └── todo.md                   # Development roadmap
 └── pyproject.toml                # Dependencies
