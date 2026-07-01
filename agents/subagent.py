@@ -5,22 +5,28 @@ Conducts focused research on a single subtopic using web search,
 then produces source-grounded analysis with key findings attributed
 to specific sources.
 
-Uses:
-- LCEL chains (prompt | llm | parser) for composable pipelines
-- Pydantic models + with_structured_output() for reliable structured data
-- StrOutputParser for free-form text analysis
+A single structured-output call returns analysis, key findings, and
+severity together — instead of three separate calls re-sending the
+same source context — to keep token cost in check.
 """
 
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List
 
 from pydantic import BaseModel, Field
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
 
-from agents.searcher import WebSearcher, SearchResult
+from agents.searcher import WebSearcher
 from agents.ioc_extractor import IOCExtractor, IOCResults
 from config import get_llm
+
+
+# Per-source content cap (chars). Lower = fewer input tokens per LLM call.
+# 2500 chars ≈ 600 tokens; with ~9 sources that's ~5.5k tokens of source
+# context — enough for grounded analysis without re-billing huge bodies
+# across multiple calls.
+SOURCE_CONTENT_CAP = 2500
+IOC_CONTENT_CAP = 8000
 
 
 # ── Pydantic Models for Structured Output ──
@@ -32,15 +38,28 @@ class KeyFindingModel(BaseModel):
     confidence: str = Field(description="High, Moderate, or Low confidence level")
 
 
-class KeyFindingsOutput(BaseModel):
-    """Extracted key findings from search results."""
-    findings: List[KeyFindingModel] = Field(description="3-7 key factual findings with source attribution")
+class ResearchOutput(BaseModel):
+    """
+    Combined research output produced in a single LLM call.
 
-
-class SeverityOutput(BaseModel):
-    """Severity assessment for a threat."""
+    The analysis field carries the long source-grounded text; the structured
+    fields carry the extracted facts and severity. Producing all three in
+    one call avoids re-sending the same source bodies to the LLM 3x.
+    """
+    analysis: str = Field(description=(
+        "Detailed source-grounded analysis (plain text, no markdown). "
+        "Every paragraph must cite at least one source as [Source N]. "
+        "Cover: SITUATION OVERVIEW, THREAT DETAILS, IMPACT ASSESSMENT, "
+        "RECOMMENDED ACTIONS — using specific dates, names, numbers from sources."
+    ))
+    key_findings: List[KeyFindingModel] = Field(description=(
+        "3-7 specific, verifiable facts extracted from the sources with "
+        "source attribution."
+    ))
     severity: str = Field(description="Critical, High, Medium, or Low")
-    justification: str = Field(description="One sentence citing specific evidence")
+    severity_justification: str = Field(description=(
+        "One sentence citing specific evidence for the severity rating."
+    ))
 
 
 # ── Data Classes for Research Results ──
@@ -87,10 +106,10 @@ class SubAgent:
     """
     Focused research agent that produces source-grounded analysis.
 
-    Uses LCEL chains for each step:
-    - analysis_chain: prompt | llm | StrOutputParser (free-form text)
-    - key_findings_chain: prompt | llm.with_structured_output (Pydantic model)
-    - severity_chain: prompt | llm.with_structured_output (Pydantic model)
+    Pipeline:
+    1. Search with Tavily (cached locally)
+    2. ONE structured-output LLM call returning analysis + findings + severity
+    3. Regex IOC extraction (no LLM)
     """
 
     def __init__(self, llm=None, topic: str = ""):
@@ -99,74 +118,34 @@ class SubAgent:
         self.searcher = WebSearcher()
         self.ioc_extractor = IOCExtractor()
 
-        # Chain 1: Source-grounded analysis (free-form text)
-        self.analysis_chain = (
+        self.research_chain = (
             ChatPromptTemplate.from_messages([
                 ("system", (
                     "You are a cyber threat intelligence analyst. "
-                    "You MUST ground every claim in the source material provided. "
-                    "Reference sources as [Source N] throughout your analysis. "
-                    "Do NOT write generic knowledge — only report what the sources say."
+                    "Ground every claim in the source material provided — "
+                    "reference sources as [Source N] throughout the analysis. "
+                    "Do NOT write generic knowledge — only report what the sources say. "
+                    "Plain text only, no markdown formatting."
                 )),
                 ("human", (
                     "Analyze these search results about: {topic}\n\n"
                     "{search_results}\n\n"
-                    "Write a detailed analysis with this structure:\n\n"
-                    "SITUATION OVERVIEW: What is happening based on the sources? Include specific "
-                    "dates, names, numbers, and facts reported.\n\n"
-                    "THREAT DETAILS: Specific threats, CVEs, malware, tools, and techniques "
-                    "described in the sources.\n\n"
-                    "IMPACT ASSESSMENT: Reported impact — organizations affected, data volumes, "
-                    "financial figures, operational disruptions from the sources.\n\n"
-                    "RECOMMENDED ACTIONS: Specific mitigations and tools recommended by the sources.\n\n"
-                    "RULES:\n"
-                    "- Every paragraph MUST cite at least one source as [Source N]\n"
-                    "- Include specific numbers, dates, and names from sources\n"
-                    "- If sources contradict, note the disagreement\n"
-                    "- Write in plain text only — no markdown formatting"
+                    "Produce a single combined output containing:\n"
+                    "1. ANALYSIS: detailed source-grounded write-up with sections "
+                    "SITUATION OVERVIEW / THREAT DETAILS / IMPACT ASSESSMENT / "
+                    "RECOMMENDED ACTIONS. Every paragraph cites at least one "
+                    "[Source N]. Include specific dates, names, numbers.\n"
+                    "2. KEY FINDINGS: 3-7 specific verifiable facts with source "
+                    "index and confidence (High/Moderate/Low). "
+                    "Good: 'CL0P exploited CVE-2023-34362 in MOVEit, breaching "
+                    "600+ organizations [Source 4]'. Bad: 'Ransomware is rising' "
+                    "(too generic).\n"
+                    "3. SEVERITY: Critical/High/Medium/Low based on impact, "
+                    "exploitability, and scope, with one-sentence evidence-based "
+                    "justification."
                 )),
             ])
-            | self.llm
-            | StrOutputParser()
-        )
-
-        # Chain 2: Key findings extraction (structured output)
-        self.key_findings_chain = (
-            ChatPromptTemplate.from_messages([
-                ("system", (
-                    "You extract key intelligence findings from search results. "
-                    "Each finding must be a specific, verifiable fact from a source — "
-                    "not opinions or generic statements."
-                )),
-                ("human", (
-                    "Extract 3-7 KEY FINDINGS from these results about: {topic}\n\n"
-                    "{search_results}\n\n"
-                    "Good: 'CL0P exploited CVE-2023-34362 in MOVEit Transfer, breaching "
-                    "600+ organizations [Source 4]'\n"
-                    "Bad: 'Ransomware attacks are increasing' (too generic)\n\n"
-                    "Each finding needs: the specific fact, which source (by index), "
-                    "and your confidence level."
-                )),
-            ])
-            | self.llm.with_structured_output(KeyFindingsOutput)
-        )
-
-        # Chain 3: Severity assessment (structured output)
-        self.severity_chain = (
-            ChatPromptTemplate.from_messages([
-                ("system", "You are a threat severity assessor."),
-                ("human", (
-                    "Rate the severity of this threat based on the analysis:\n\n"
-                    "Topic: {topic}\n"
-                    "Analysis: {analysis}\n\n"
-                    "Consider:\n"
-                    "- Impact: What damage can this cause? Are there reported incidents?\n"
-                    "- Exploitability: Are exploits actively used in the wild?\n"
-                    "- Scope: How many systems/organizations affected?\n\n"
-                    "Provide severity (Critical/High/Medium/Low) with evidence-based justification."
-                )),
-            ])
-            | self.llm.with_structured_output(SeverityOutput)
+            | self.llm.with_structured_output(ResearchOutput)
         )
 
     def _build_source_text(
@@ -179,60 +158,35 @@ class SubAgent:
             if i < len(sources)
         )
 
-    def _extract_key_findings(
-        self, formatted_results: str, sources: List[Citation]
+    def _map_findings(
+        self, raw_findings: List[KeyFindingModel], sources: List[Citation]
     ) -> List[KeyFinding]:
-        """Extract source-attributed key findings using structured output chain."""
-        try:
-            result = self.key_findings_chain.invoke({
-                "topic": self.topic,
-                "search_results": formatted_results,
-            })
-            findings = []
-            for item in result.findings:
-                idx = item.source_index - 1  # Convert to 0-based
-                if 0 <= idx < len(sources):
-                    src = sources[idx]
-                elif sources:
-                    src = sources[0]
-                else:
-                    continue
-                findings.append(KeyFinding(
-                    finding=item.finding,
-                    source_title=src.title,
-                    source_url=src.url,
-                    confidence=item.confidence,
-                ))
-            return findings
-        except Exception as e:
-            # Structured output can fail with some models — degrade gracefully
-            import logging
-            logging.getLogger(__name__).warning(
-                f"Key findings extraction failed, falling back: {e}"
-            )
-            return []
-
-    def _assess_severity(self, analysis: str) -> str:
-        """Assess threat severity using structured output chain."""
-        try:
-            result = self.severity_chain.invoke({
-                "topic": self.topic,
-                "analysis": analysis,
-            })
-            return result.severity
-        except Exception:
-            return "Unknown"
+        """Map structured findings back to concrete source citations."""
+        out: List[KeyFinding] = []
+        for item in raw_findings:
+            idx = item.source_index - 1
+            if 0 <= idx < len(sources):
+                src = sources[idx]
+            elif sources:
+                src = sources[0]
+            else:
+                continue
+            out.append(KeyFinding(
+                finding=item.finding,
+                source_title=src.title,
+                source_url=src.url,
+                confidence=item.confidence,
+            ))
+        return out
 
     def research(self, queries: List[str]) -> ResearchFinding:
         """
         Conduct focused, source-grounded research on the topic.
 
         Pipeline:
-        1. Search with Tavily (full content via include_raw_content)
-        2. Analyze findings with source citations (LCEL chain)
-        3. Extract key findings with source attribution (structured output)
-        4. Extract IOCs from raw content (regex)
-        5. Assess severity (structured output)
+        1. Search with Tavily (full content via include_raw_content, cached)
+        2. Single LLM call → analysis + key findings + severity
+        3. IOC extraction from raw content (regex)
         """
         all_sources: List[Citation] = []
         search_content: List[str] = []
@@ -245,39 +199,43 @@ class SubAgent:
                 all_sources.append(Citation(title=result.title, url=result.url))
                 # Prefer raw_content (full article) over content (snippet)
                 best_content = result.raw_content if result.raw_content else result.content
-                # Cap individual source content to avoid token overflow
-                if len(best_content) > 4000:
-                    best_content = best_content[:4000] + "\n[...]"
+                if len(best_content) > SOURCE_CONTENT_CAP:
+                    best_content = best_content[:SOURCE_CONTENT_CAP] + "\n[...]"
                 search_content.append(best_content)
-                # Cap content for IOC extraction — article body (where real
+                # IOC extraction uses a larger window: article body (where real
                 # IOCs live) comes first in Tavily markdown; page chrome
                 # (navbars, footers, sidebars) is appended after.
                 ioc_content = result.raw_content or result.content
-                if len(ioc_content) > 8000:
-                    ioc_content = ioc_content[:8000]
+                if len(ioc_content) > IOC_CONTENT_CAP:
+                    ioc_content = ioc_content[:IOC_CONTENT_CAP]
                 raw_text_for_iocs.append(ioc_content)
                 raw_sources.append(SourceContent(
                     title=result.title, url=result.url,
                     content=best_content,
                 ))
 
-        # Build numbered source text for LLM
         formatted_results = self._build_source_text(all_sources, search_content)
 
-        # Step 1: Source-grounded analysis (LCEL chain)
-        analysis = self.analysis_chain.invoke({
-            "topic": self.topic,
-            "search_results": formatted_results,
-        })
+        # Single LLM call → analysis + key findings + severity
+        try:
+            result = self.research_chain.invoke({
+                "topic": self.topic,
+                "search_results": formatted_results,
+            })
+            analysis = result.analysis
+            key_findings = self._map_findings(result.key_findings, all_sources)
+            severity = result.severity or "Unknown"
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(
+                f"Research structured output failed for '{self.topic}': {e}"
+            )
+            analysis = ""
+            key_findings = []
+            severity = "Unknown"
 
-        # Step 2: Key findings with source attribution (structured output)
-        key_findings = self._extract_key_findings(formatted_results, all_sources)
-
-        # Step 3: IOC extraction from raw content (regex — no LLM needed)
+        # IOC extraction from raw content (regex — no LLM needed)
         iocs = self.ioc_extractor.extract("\n".join(raw_text_for_iocs))
-
-        # Step 4: Severity assessment (structured output)
-        severity = self._assess_severity(analysis)
 
         return ResearchFinding(
             topic=self.topic,

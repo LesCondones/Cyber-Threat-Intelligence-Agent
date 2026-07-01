@@ -18,3 +18,4 @@ reports/*.xlsx
 tasks/*
 cti_server_setup.sh
 
+test_prompts.txt

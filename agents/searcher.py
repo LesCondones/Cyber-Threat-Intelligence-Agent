@@ -4,6 +4,10 @@ Web Search Agent
 Uses Tavily API for advanced web search with full content extraction.
 Returns complete article content (not just snippets) via include_raw_content,
 giving downstream agents real source material to ground their analysis in.
+
+Results are cached locally (SQLite, 7-day TTL) keyed by (query, max_results)
+so repeat investigations don't re-hit Tavily and re-feed the LLM the same
+content.
 """
 
 import time
@@ -12,6 +16,7 @@ from dataclasses import dataclass, field
 from tavily import TavilyClient
 from typing import List
 from config import settings
+from database.search_cache import SearchCache
 
 logger = logging.getLogger(__name__)
 
@@ -31,21 +36,39 @@ class WebSearcher:
     """
     Agent for web search using Tavily API.
 
-    Fetches full page content via include_raw_content="markdown" so
-    downstream analysis is grounded in actual source material rather
-    than brief snippets.
+    Fetches full page content via include_raw_content=True so downstream
+    analysis is grounded in actual source material rather than brief
+    snippets. Results are cached locally to avoid re-querying Tavily for
+    the same query within the cache TTL.
     """
     client: TavilyClient = field(
         default_factory=lambda: TavilyClient(api_key=settings.tavily_api_key)
     )
+    cache: SearchCache = field(default_factory=SearchCache)
     max_retries: int = 3
+
+    @staticmethod
+    def _to_search_result(raw: dict) -> SearchResult:
+        return SearchResult(
+            title=raw.get("title", ""),
+            url=raw.get("url", ""),
+            content=raw.get("content", ""),
+            raw_content=raw.get("raw_content", "") or "",
+            score=raw.get("score", 0.0),
+        )
 
     def search(self, query: str, max_results: int = 5) -> List[SearchResult]:
         """
         Search the web and return results with full content.
 
-        Retries on failure with exponential backoff.
+        Hits the local cache first. On miss, calls Tavily with exponential
+        backoff retry and persists the response.
         """
+        cached = self.cache.get(query, max_results)
+        if cached is not None:
+            logger.info(f"Search cache hit: '{query}'")
+            return [self._to_search_result(r) for r in cached]
+
         for attempt in range(self.max_retries):
             try:
                 response = self.client.search(
@@ -55,16 +78,9 @@ class WebSearcher:
                     include_raw_content=True,
                 )
 
-                return [
-                    SearchResult(
-                        title=result.get("title", ""),
-                        url=result.get("url", ""),
-                        content=result.get("content", ""),
-                        raw_content=result.get("raw_content", "") or "",
-                        score=result.get("score", 0.0),
-                    )
-                    for result in response.get("results", [])
-                ]
+                raw_results = response.get("results", [])
+                self.cache.set(query, max_results, raw_results)
+                return [self._to_search_result(r) for r in raw_results]
             except Exception as e:
                 wait = 2 ** attempt
                 logger.warning(
