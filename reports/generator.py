@@ -140,12 +140,6 @@ def _build_styles():
         fontSize=10, leading=13, spaceAfter=2,
     ))
     styles.add(ParagraphStyle(
-        name="KeyFinding", parent=styles["BodyText"],
-        fontSize=10, leading=14, spaceAfter=4,
-        leftIndent=12, borderColor=colors.HexColor("#4472C4"),
-        borderWidth=0, borderPadding=4,
-    ))
-    styles.add(ParagraphStyle(
         name="FrameworkField", parent=styles["BodyText"],
         fontSize=10, leading=14, spaceAfter=4,
     ))
@@ -364,19 +358,17 @@ class ReportGenerator:
             a = framework_analysis.assessment
             if a.overall_confidence != "Low" or a.key_judgments:
                 elements.append(Paragraph("Intelligence Assessment", styles["SectionHeading"]))
+                # Confidence / reliability / credibility on one line \u2014 three
+                # separate paragraphs was needless vertical bloat.
                 elements.append(Paragraph(
-                    f"<b>Overall Confidence:</b> {_escape_xml(a.overall_confidence)}",
+                    f"<b>Confidence:</b> {_escape_xml(a.overall_confidence)} "
+                    f"&nbsp;|&nbsp; <b>Source Reliability:</b> {_escape_xml(a.source_reliability)} "
+                    f"&nbsp;|&nbsp; <b>Info Credibility:</b> {_escape_xml(a.information_credibility)}",
                     styles["FrameworkField"],
                 ))
-                elements.append(Paragraph(
-                    f"<b>Source Reliability:</b> {_escape_xml(a.source_reliability)}",
-                    styles["FrameworkField"],
-                ))
-                elements.append(Paragraph(
-                    f"<b>Information Credibility:</b> {_escape_xml(a.information_credibility)}",
-                    styles["FrameworkField"],
-                ))
-                if a.key_judgments:
+                # Key judgments are only shown here when there is no TL;DR card;
+                # otherwise the TL;DR already carries them in executive language.
+                if a.key_judgments and not tldr_bullets:
                     elements.append(Spacer(1, 4))
                     elements.append(Paragraph("<b>Key Judgments:</b>", styles["FrameworkField"]))
                     for j in a.key_judgments:
@@ -522,30 +514,6 @@ class ReportGenerator:
                 ("title", "description", "query"),
             )
 
-        # ── Key Intelligence Findings ──
-        all_key_findings = []
-        for f in findings:
-            all_key_findings.extend(f.key_findings)
-
-        if all_key_findings:
-            elements.append(Paragraph(
-                "Key Intelligence Findings", styles["SectionHeading"]
-            ))
-            for kf in all_key_findings:
-                confidence_color = {
-                    "High": "#228B22", "Moderate": "#DAA520", "Low": "#CC0000"
-                }.get(kf.confidence, "#666666")
-
-                elements.append(Paragraph(
-                    f'\u2022 {_escape_xml(kf.finding)}<br/>'
-                    f'<font size="8" color="#666666">'
-                    f'Source: <a href="{kf.source_url}" color="blue">{_escape_xml(kf.source_title)}</a>'
-                    f' | Confidence: <font color="{confidence_color}">{kf.confidence}</font>'
-                    f'</font>',
-                    styles["KeyFinding"],
-                ))
-            elements.append(Spacer(1, 8))
-
         # ── Severity Overview ──
         elements.append(Paragraph("Threat Severity Overview", styles["SectionHeading"]))
 
@@ -615,19 +583,17 @@ class ReportGenerator:
                 ))
                 elements.append(_build_kill_chain_diagram(kc))
                 elements.append(Spacer(1, 6))
+                # One compact line per observed phase — the diagram already
+                # conveys which phases have evidence, so drop the per-phase
+                # sub-headings and fold evidence inline.
                 for phase in kc:
-                    elements.append(Paragraph(
-                        f"<b>{_escape_xml(phase.phase)}</b>", styles["SubHeading"]
-                    ))
-                    elements.append(Paragraph(
-                        _escape_xml(phase.description), styles["FrameworkField"]
-                    ))
+                    line = f"<b>{_escape_xml(phase.phase)}:</b> {_escape_xml(phase.description)}"
                     if phase.evidence:
-                        elements.append(Paragraph(
-                            f"<i>Evidence:</i> {_escape_xml(phase.evidence)}",
-                            styles["FrameworkField"],
-                        ))
-                    elements.append(Spacer(1, 4))
+                        line += (
+                            f" <font color='#666666'><i>(Evidence: "
+                            f"{_escape_xml(phase.evidence)})</i></font>"
+                        )
+                    elements.append(Paragraph(line, styles["FrameworkField"]))
 
         # ── Detailed Findings ──
         elements.append(PageBreak())

@@ -1,0 +1,8 @@
+# MiniLM (sentence-transformers) is text-only and pulls in transformers'
+# image-processing modules that lazily `import torchvision`. Streamlit's module
+# file-watcher walks those imports on every run, flooding the console with
+# torchvision ModuleNotFoundError tracebacks. We don't need hot-reload for an
+# investigation tool, so turn the watcher off. (Restart the app to pick up code
+# changes.)
+[server]
+fileWatcherType = "none"
